@@ -1,2 +1,8 @@
 node_modules/
 .DS_Store
+
+# Reference photographs for test/bench.html. Kept local: they are pictures of
+# real hands, desks and phone screens, and this repo is published.
+test/*.jpeg
+test/*.jpg
+test/*.png

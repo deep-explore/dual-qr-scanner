@@ -125,8 +125,13 @@ proves the implementation, not the model. The real check is below.
 
 `test/bench.html` runs actual photographs of a labelled glass reagent bottle —
 two paper labels wrapped around the curve — through the same pipeline, and
-fails if any of them does not give up both codes. The photographs live in
-`test/` and are never precached, so they add nothing to the offline payload.
+fails if any of them does not give up both codes.
+
+The photographs themselves are **not committed** — they are pictures of real
+hands, desks and phone screens, and this repository is published. Drop your own
+into `test/` and list them at the top of `bench.html`; with none present the
+page says so rather than reporting a failure. They are never precached either
+way, so they add nothing to the offline payload.
 
 | | no dewarp | swept |
 | --- | --- | --- |

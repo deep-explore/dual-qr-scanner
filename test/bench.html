@@ -51,6 +51,7 @@
       const out = document.getElementById("out");
       const progress = document.getElementById("progress");
       let failures = 0;
+      let missing = 0;
 
       async function grayAt(bitmap, longEdge) {
         const scale = Math.min(1, longEdge / Math.max(bitmap.width, bitmap.height));
@@ -64,7 +65,18 @@
 
       for (const name of IMAGES) {
         progress.textContent = `Decoding ${name}…`;
-        const bitmap = await createImageBitmap(await (await fetch(encodeURIComponent(name))).blob());
+
+        // The photographs are deliberately not committed, so a fresh clone has
+        // none. That is a "cannot run", not a failure.
+        let bitmap;
+        try {
+          const res = await fetch(encodeURIComponent(name));
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          bitmap = await createImageBitmap(await res.blob());
+        } catch {
+          missing++;
+          continue;
+        }
 
         const rows = [];
         let shipping = null;
@@ -100,14 +112,23 @@
         bitmap.close();
       }
 
+      const ran = IMAGES.length - missing;
       const verdict = document.getElementById("verdict");
-      verdict.textContent =
-        failures === 0
-          ? `ALL ${IMAGES.length} REAL IMAGES READ BOTH CODES`
-          : `${failures} of ${IMAGES.length} REAL IMAGES FAILED`;
-      verdict.className = `verdict ${failures === 0 ? "pass" : "fail"}`;
-      progress.textContent = "";
-      document.title = failures === 0 ? "bench: PASS" : "bench: FAIL";
+      if (ran === 0) {
+        verdict.textContent = "NO REFERENCE PHOTOGRAPHS FOUND";
+        verdict.className = "verdict";
+        progress.textContent =
+          "The bottle photographs are not committed to the repository. Drop your own into test/ and list them in bench.html.";
+        document.title = "bench: no images";
+      } else {
+        verdict.textContent =
+          failures === 0
+            ? `ALL ${ran} REAL IMAGES READ BOTH CODES`
+            : `${failures} of ${ran} REAL IMAGES FAILED`;
+        verdict.className = `verdict ${failures === 0 ? "pass" : "fail"}`;
+        progress.textContent = missing ? `${missing} photograph(s) not present locally.` : "";
+        document.title = failures === 0 ? "bench: PASS" : "bench: FAIL";
+      }
     </script>
   </body>
 </html>
