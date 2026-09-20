@@ -6,16 +6,26 @@
     <title>What the un-distortion does</title>
     <link rel="stylesheet" href="../styles.css" />
     <style>
-      .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); gap: 12px; }
       .panel { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--panel); }
       .panel.hit { border-color: var(--accent); }
-      .panel canvas { width: 100%; display: block; background: #000; }
-      .panel .cap { padding: 7px 9px; font-size: 11px; font-family: ui-monospace, Menlo, monospace; }
+      .panel .shot { width: 100%; display: block; background: #000; }
+      .panel .cap { padding: 8px 9px; font-size: 11px; font-family: ui-monospace, Menlo, monospace; line-height: 1.5; }
       .panel .cap b { color: var(--accent); }
       .panel .cap .miss { color: var(--muted); }
+      .panel .cap .prm { color: var(--muted); }
+      .panel .curve { display: block; margin: 0 9px; border-top: 1px solid var(--line); }
       .wide { max-width: 100%; border: 1px solid var(--line); border-radius: 8px; display: block; }
-      h2 { font-size: 15px; margin: 22px 0 8px; }
+      h2 { font-size: 15px; margin: 24px 0 8px; }
       p.note { color: var(--muted); font-size: 13px; }
+      pre { background: #0b0f14; border: 1px solid var(--line); border-radius: 8px; padding: 12px;
+            overflow-x: auto; font-size: 12px; font-family: ui-monospace, Menlo, monospace; }
+      pre .hl { color: var(--accent); }
+      table { border-collapse: collapse; width: 100%; font-size: 12px; }
+      th, td { border: 1px solid var(--line); padding: 5px 8px; text-align: left; }
+      th { color: var(--muted); font-weight: 600; }
+      td.num { text-align: right; font-family: ui-monospace, Menlo, monospace; }
+      .env { color: var(--muted); font-size: 11px; margin-top: 6px; }
     </style>
   </head>
   <body>
@@ -33,21 +43,55 @@
       </p>
       <canvas id="original" class="wide"></canvas>
 
-      <h2>2. Every correction it tries</h2>
+      <h2>2. The function</h2>
       <p class="note">
-        Each panel is the <em>same photograph</em>, re-sampled as if the bottle
-        curved by a particular amount (<code>t</code>), with its nearest edge in
-        a particular place (<code>c</code>). Green panels are the ones that
-        actually decoded something. Notice that no single panel gets both
-        labels &mdash; that is the whole reason the scanner pools them.
+        Walk around the bottle in equal steps and those steps land
+        <em>unevenly</em> in the photo &mdash; spread out at the front, crushed
+        towards the silhouette, following a sine. To undo it, each output column
+        is an equal step around the bottle, and we fetch the pixel from wherever
+        that step actually landed:
+      </p>
+      <pre>
+<span class="hl">h = 1 - |c|                                  </span>  half-width of the visible arc
+<span class="hl">source(u) = c + h * sin( t * (u - c) / h ) / sin(t)</span>
+
+  u        output position, normalised so the frame spans -1 .. +1
+  source   where to read from, same units
+  t        how much bottle curve half the frame covers  (radians)
+  c        where the bottle's nearest edge sits         (-1 .. +1)
+
+  t -> 0 collapses to source(u) = u, i.e. no change at all.
+  Pixel column = (source + 1) / 2 * width, sampled between neighbours.</pre>
+      <p class="note">
+        That is the whole distortion model &mdash; <code>sourceCoord()</code> in
+        <code>dewarp.js</code>. The axis parameter only decides whether it is
+        applied across columns (standing bottle) or down rows (lying one). Since
+        the result depends solely on <code>t</code>, <code>c</code> and the frame
+        width, each correction is precomputed once into a lookup table and reused
+        for every row of every frame.
+      </p>
+
+      <h2>3. Every correction it tries</h2>
+      <p class="note">
+        Each panel is the <em>same photograph</em> re-sampled with the parameters
+        shown. The graph is how far that correction drags each column sideways:
+        the dashed line is "no shift", and the green curve is the shift, scaled
+        to its own peak (given in pixels beside the parameters). Green-bordered
+        panels decoded something &mdash; notice that no single panel gets both
+        labels, which is why the scanner pools them.
       </p>
       <div id="grid" class="grid"></div>
+
+      <h2>4. Performance</h2>
+      <div id="perf"></div>
+
       <p><a class="btn ghost" href="../index.html">Back to scanner</a></p>
     </main>
 
     <script type="module">
       import { decodeWithCandidate, toGray, CANDIDATES } from "../pipeline.js";
-      import { dewarpGray } from "../dewarp.js";
+      import { dewarpGray, sampleTable } from "../dewarp.js";
+      import { MAX_CODES } from "../policy.js";
 
       const PHOTOS = [
         "WhatsApp Image 2026-09-18 at 10.18.14.jpeg",
@@ -84,38 +128,152 @@
         wctx.drawImage(bmp, 0, 0, W, H);
         const gray = toGray(wctx.getImageData(0, 0, W, H).data, W, H);
 
-        // Find the band of the frame holding the labels, so the panels show the
-        // codes big rather than a lot of bottle. Picked by looking for the
-        // brightest rows, since the labels are white paper on dark glass.
         const band = brightestBand(gray, 210);
         drawCrop(document.getElementById("original"), gray, band);
 
         const grid = document.getElementById("grid");
         const vertical = CANDIDATES.filter((c) => c.axis === "v");
+        const rows = [];
         let done = 0;
 
-        for (const cand of vertical) {
-          const plane = dewarpGray(gray, W, H, cand);
-          const found = await decodeWithCandidate(gray, W, H, cand);
+        // The first decode of the session pays for starting the WebAssembly
+        // module. Charging that to the first candidate would overstate it by
+        // about 35 ms and skew every average on this page.
+        status.textContent = "Warming up the decoder…";
+        await decodeWithCandidate(gray, W, H, vertical[0]);
 
+        // Measure everything before drawing anything. Timing across an await
+        // while the page is painting 600x200 canvases pulls that paint work
+        // into the measured window and inflates it several-fold. Best-of-N,
+        // because scheduling noise only ever adds time.
+        status.textContent = "Measuring…";
+        for (const cand of vertical) {
+          let warpMs = Infinity;
+          for (let i = 0; i < 3; i++) {
+            const t0 = performance.now();
+            dewarpGray(gray, W, H, cand);
+            warpMs = Math.min(warpMs, performance.now() - t0);
+          }
+          let totalMs = Infinity;
+          let found = [];
+          for (let i = 0; i < 2; i++) {
+            const t0 = performance.now();
+            found = await decodeWithCandidate(gray, W, H, cand);
+            totalMs = Math.min(totalMs, performance.now() - t0);
+          }
+          rows.push({ cand, found, warpMs, totalMs });
+        }
+
+        for (const { cand, found, warpMs, totalMs } of rows) {
+          const plane = dewarpGray(gray, W, H, cand);
           const panel = document.createElement("div");
           panel.className = `panel ${found.length ? "hit" : ""}`;
-          const canvas = document.createElement("canvas");
-          panel.append(canvas);
+
+          const shot = document.createElement("canvas");
+          shot.className = "shot";
+          panel.append(shot);
+
+          const curve = document.createElement("canvas");
+          curve.className = "curve";
+          panel.append(curve);
+          const peak = drawCurve(curve, cand);
+
           const cap = document.createElement("div");
           cap.className = "cap";
-          const label = cand.theta < 1e-4 ? "no correction at all" : `t=${cand.theta}  c=${cand.center}`;
+          const params =
+            cand.theta < 1e-4
+              ? `<span class="prm">axis=${cand.axis} &nbsp;t=0 (identity) &nbsp;&middot;&nbsp; shifts nothing</span>`
+              : `<span class="prm">axis=${cand.axis} &nbsp;t=${cand.theta} &nbsp;c=${cand.center} &nbsp;(${Math.round((cand.theta * 180) / Math.PI)}&deg;) &nbsp;&middot;&nbsp; shifts up to ${peak.toFixed(0)}px</span>`;
+          const timing = `<span class="prm">warp ${warpMs.toFixed(1)}ms &middot; decode ${(totalMs - warpMs).toFixed(1)}ms</span>`;
           cap.innerHTML = found.length
-            ? `${label}<br><b>✓ ${found.map((f) => f.text.slice(0, 18)).join(", ")}</b>`
-            : `${label}<br><span class="miss">nothing</span>`;
+            ? `${params}<br>${timing}<br><b>✓ ${found.map((f) => f.text.slice(0, 18)).join(", ")}</b>`
+            : `${params}<br>${timing}<br><span class="miss">nothing</span>`;
           panel.append(cap);
-          grid.append(panel);
-          drawCrop(canvas, plane, band);
 
-          status.textContent = `Decoding… ${++done}/${vertical.length}`;
+          grid.append(panel);
+          drawCrop(shot, plane, band);
+          done++;
         }
+
+        renderPerf(rows, vertical.length);
         status.textContent = "Each panel is the same photo, un-bent a different way.";
         status.className = "status ok";
+      }
+
+      function renderPerf(rows, count) {
+        const sum = (f) => rows.reduce((a, r) => a + f(r), 0);
+        const totalAll = sum((r) => r.totalMs);
+        const warpAll = sum((r) => r.warpMs);
+
+        // What the live scanner actually pays: it stops as soon as the pair is
+        // complete, so only the candidates up to that point are charged for.
+        const seen = new Set();
+        let earlyMs = 0;
+        let earlyCount = 0;
+        for (const r of rows) {
+          earlyMs += r.totalMs;
+          earlyCount++;
+          r.found.forEach((f) => seen.add(f.text));
+          if (seen.size >= MAX_CODES) break;
+        }
+        const complete = seen.size >= MAX_CODES;
+
+        const table = `
+          <table>
+            <tr><th>Measure</th><th>Value</th><th>Note</th></tr>
+            <tr><td>Frame handed to the decoder</td><td class="num">${W}×${H}</td><td>${((W * H) / 1e6).toFixed(2)} megapixels</td></tr>
+            <tr><td>Un-distortion, per candidate</td><td class="num">${(warpAll / count).toFixed(1)} ms</td><td>pure resampling, one lookup table</td></tr>
+            <tr><td>Decode, per candidate</td><td class="num">${((totalAll - warpAll) / count).toFixed(1)} ms</td><td>ZXing, including greyscale-to-RGBA</td></tr>
+            <tr><td>Full sweep, all ${count} candidates</td><td class="num">${totalAll.toFixed(0)} ms</td><td>worst case: a frame with no codes</td></tr>
+            <tr><td><b>What a live frame actually costs</b></td><td class="num"><b>${earlyMs.toFixed(0)} ms</b></td><td>${complete ? `stopped after ${earlyCount} candidates, both codes in hand` : "never completed the pair on this photo"}</td></tr>
+            <tr><td>Warping as a share of the work</td><td class="num">${((warpAll / totalAll) * 100).toFixed(0)}%</td><td>the geometry is cheap; decoding dominates</td></tr>
+          </table>
+          <p class="env">Measured in this browser, just now, on ${navigator.hardwareConcurrency ?? "?"} logical cores &mdash;
+          best of several runs each, taken before any of this page was drawn, since paint work otherwise lands inside the timings.
+          A phone will be slower &mdash; expect roughly 2-4&times;. The scanner runs all of this on a
+          background thread, so the camera preview stays smooth regardless.</p>`;
+        document.getElementById("perf").innerHTML = table;
+      }
+
+      // Plotted as the shift away from "change nothing", not the raw mapping.
+      // At t=0.7 the raw curve departs from the diagonal by about 3% of half
+      // the width and reads as a straight line, which tells you nothing. The
+      // shift shows how far each column is actually dragged, and how far apart
+      // the two winning corrections really are. Returns the peak, in pixels.
+      function drawCurve(canvas, cand) {
+        const w = 250;
+        const h = 64;
+        canvas.width = w;
+        canvas.height = h;
+        canvas.style.width = "calc(100% - 18px)";
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#0b0f14";
+        ctx.fillRect(0, 0, w, h);
+
+        const table = sampleTable(cand, W);
+        let peak = 0;
+        for (let i = 0; i < W; i++) peak = Math.max(peak, Math.abs(table[i] - i));
+        const scale = peak > 0.5 ? peak : 1;
+
+        ctx.strokeStyle = "#39414d";
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath();
+        ctx.moveTo(0, h / 2);
+        ctx.lineTo(w, h / 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        ctx.strokeStyle = "#39d98a";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        for (let i = 0; i < w; i++) {
+          const idx = Math.round((i / (w - 1)) * (W - 1));
+          const y = h / 2 - ((table[idx] - idx) / scale) * (h / 2 - 3);
+          if (i === 0) ctx.moveTo(i, y);
+          else ctx.lineTo(i, y);
+        }
+        ctx.stroke();
+        return peak;
       }
 
       function brightestBand(gray, height) {
