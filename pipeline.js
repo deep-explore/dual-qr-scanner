@@ -5,7 +5,7 @@ import { prepareZXingModule, readBarcodes } from "./vendor/zxing/reader/index.js
 import { CANDIDATES, dewarpGray, toSourcePoint } from "./dewarp.js";
 import { MAX_CODES, isComplete, mergeFrameResults } from "./policy.js";
 
-const WASM_URL = new URL("./vendor/zxing/zxing_reader.wasm", import.meta.url).href;
+const WASM_URL = new URL("./vendor/zxing/reader/zxing_reader.wasm", import.meta.url).href;
 
 prepareZXingModule({
   overrides: {

@@ -21,7 +21,7 @@ const ASSETS = [
   "./icons/icon-maskable-512.png",
   "./vendor/zxing/reader/index.js",
   "./vendor/zxing/share.js",
-  "./vendor/zxing/zxing_reader.wasm",
+  "./vendor/zxing/reader/zxing_reader.wasm",
   "./test/fixtures.js",
   "./test/warp.js",
 ];

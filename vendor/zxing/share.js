@@ -585,10 +585,11 @@ function V(e = B) {
 }
 //#endregion
 //#region src/share.ts
-var H = "3.1.4", U = "0b2d9a8fc81f420f369928c24331091ff0525976", W = { locateFile: (e, t) => {
-	let n = e.match(/_(.+?)\.wasm$/);
-	return n ? `https://fastly.jsdelivr.net/npm/zxing-wasm@3.1.4/dist/${n[1]}/${e}` : t + e;
-} }, G = /* @__PURE__ */ new WeakMap();
+// LOCAL MODIFICATION (see vendor/zxing/NOTICE.md): upstream defaults to
+// fetching the .wasm from the jsDelivr CDN. This app must work with no network
+// at all, so the default now resolves the file next to this module. The app
+// also passes an explicit locateFile; this is the belt to that pair of braces.
+var H = "3.1.4", U = "0b2d9a8fc81f420f369928c24331091ff0525976", W = { locateFile: (e, t) => t + e }, G = /* @__PURE__ */ new WeakMap();
 function K(e, t) {
 	return Object.is(e, t) || Object.keys(e).length === Object.keys(t).length && Object.keys(e).every((n) => Object.hasOwn(t, n) && e[n] === t[n]);
 }

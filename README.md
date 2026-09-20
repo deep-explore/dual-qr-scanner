@@ -179,7 +179,35 @@ If real-world results disappoint, the upgrade path is OpenCV's WeChat detector
 browser build but costs ~8–10 MB of precache. `pipeline.js` is the only file
 that talks to the decoder, so swapping it is contained.
 
+## Offline guarantee
+
+There are no runtime dependencies outside this repository, and nothing is
+fetched from a CDN. The decoder is vendored, the fonts are the system stack,
+and the icons are generated. Upstream's wrapper defaulted to pulling the
+`.wasm` from jsDelivr; that default has been replaced with a local one, so no
+code path can reach the network even if the app's explicit override were lost
+(see `vendor/zxing/NOTICE.md`).
+
+Verified by loading every page with a fresh module graph and asserting that no
+request leaves the origin. To re-check after a dependency update:
+
+```bash
+grep -rn "https\?://" --include="*.js" --include="*.html" --include="*.css" . | grep -v ./test/ | grep -v ./scripts/
+```
+
 ## Licence
 
-App code: do as you like. Bundled decoder: ZXing-C++ under Apache-2.0, see
-`vendor/zxing/LICENSE`.
+App code: do as you like.
+
+Bundled third-party code, both permissive and both fine for commercial use
+including in closed products, provided the licence texts ship with it — which
+is why they are kept in `vendor/zxing/`:
+
+| Component | Licence |
+| --- | --- |
+| zxing-wasm wrapper (`reader/index.js`, `share.js`) | MIT — `vendor/zxing/LICENSE-zxing-wasm.txt` |
+| ZXing-C++ decoder (`reader/zxing_reader.wasm`) | Apache-2.0 — `vendor/zxing/LICENSE-zxing-cpp.txt` |
+
+`vendor/zxing/NOTICE.md` records what is bundled and the one local
+modification, which Apache-2.0 asks for. No copyleft (GPL/LGPL/AGPL) code is
+included.
