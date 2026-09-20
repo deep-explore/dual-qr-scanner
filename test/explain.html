@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>What the un-distortion does</title>
+    <link rel="stylesheet" href="../styles.css" />
+    <style>
+      .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+      .panel { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--panel); }
+      .panel.hit { border-color: var(--accent); }
+      .panel canvas { width: 100%; display: block; background: #000; }
+      .panel .cap { padding: 7px 9px; font-size: 11px; font-family: ui-monospace, Menlo, monospace; }
+      .panel .cap b { color: var(--accent); }
+      .panel .cap .miss { color: var(--muted); }
+      .wide { max-width: 100%; border: 1px solid var(--line); border-radius: 8px; display: block; }
+      h2 { font-size: 15px; margin: 22px 0 8px; }
+      p.note { color: var(--muted); font-size: 13px; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>What the un-distortion does</h1>
+      <p class="sub">Every correction the scanner tries, on your own photograph</p>
+    </header>
+    <main>
+      <p id="status" class="status">Loading&hellip;</p>
+
+      <h2>1. What the camera sees</h2>
+      <p class="note">
+        The bottle squeezes the label towards its edges. The squares stop being
+        square, and the decoder reads nothing at all.
+      </p>
+      <canvas id="original" class="wide"></canvas>
+
+      <h2>2. Every correction it tries</h2>
+      <p class="note">
+        Each panel is the <em>same photograph</em>, re-sampled as if the bottle
+        curved by a particular amount (<code>t</code>), with its nearest edge in
+        a particular place (<code>c</code>). Green panels are the ones that
+        actually decoded something. Notice that no single panel gets both
+        labels &mdash; that is the whole reason the scanner pools them.
+      </p>
+      <div id="grid" class="grid"></div>
+      <p><a class="btn ghost" href="../index.html">Back to scanner</a></p>
+    </main>
+
+    <script type="module">
+      import { decodeWithCandidate, toGray, CANDIDATES } from "../pipeline.js";
+      import { dewarpGray } from "../dewarp.js";
+
+      const PHOTOS = [
+        "WhatsApp Image 2026-09-18 at 10.18.14.jpeg",
+        "WhatsApp Image 2026-09-18 at 10.02.37.jpeg",
+        "WhatsApp Image 2026-09-18 at 10.18.22.jpeg",
+        "WhatsApp Image 2026-09-18 at 10.18.54.jpeg",
+        "WhatsApp Image 2026-09-20 at 19.00.07.jpeg",
+      ];
+      const W = 607;
+      const H = 1080;
+      const status = document.getElementById("status");
+
+      let bitmap = null;
+      for (const name of PHOTOS) {
+        try {
+          const res = await fetch(encodeURIComponent(name));
+          if (!res.ok) continue;
+          bitmap = await createImageBitmap(await res.blob());
+          break;
+        } catch {
+          /* try the next one */
+        }
+      }
+      if (!bitmap) {
+        status.textContent = "No reference photograph found in test/. Drop one in and list it at the top of this file.";
+        status.className = "status error";
+      } else {
+        await run(bitmap);
+      }
+
+      async function run(bmp) {
+        const work = new OffscreenCanvas(W, H);
+        const wctx = work.getContext("2d", { willReadFrequently: true });
+        wctx.drawImage(bmp, 0, 0, W, H);
+        const gray = toGray(wctx.getImageData(0, 0, W, H).data, W, H);
+
+        // Find the band of the frame holding the labels, so the panels show the
+        // codes big rather than a lot of bottle. Picked by looking for the
+        // brightest rows, since the labels are white paper on dark glass.
+        const band = brightestBand(gray, 210);
+        drawCrop(document.getElementById("original"), gray, band);
+
+        const grid = document.getElementById("grid");
+        const vertical = CANDIDATES.filter((c) => c.axis === "v");
+        let done = 0;
+
+        for (const cand of vertical) {
+          const plane = dewarpGray(gray, W, H, cand);
+          const found = await decodeWithCandidate(gray, W, H, cand);
+
+          const panel = document.createElement("div");
+          panel.className = `panel ${found.length ? "hit" : ""}`;
+          const canvas = document.createElement("canvas");
+          panel.append(canvas);
+          const cap = document.createElement("div");
+          cap.className = "cap";
+          const label = cand.theta < 1e-4 ? "no correction at all" : `t=${cand.theta}  c=${cand.center}`;
+          cap.innerHTML = found.length
+            ? `${label}<br><b>✓ ${found.map((f) => f.text.slice(0, 18)).join(", ")}</b>`
+            : `${label}<br><span class="miss">nothing</span>`;
+          panel.append(cap);
+          grid.append(panel);
+          drawCrop(canvas, plane, band);
+
+          status.textContent = `Decoding… ${++done}/${vertical.length}`;
+        }
+        status.textContent = "Each panel is the same photo, un-bent a different way.";
+        status.className = "status ok";
+      }
+
+      function brightestBand(gray, height) {
+        let best = 0;
+        let bestSum = -1;
+        for (let y = 0; y + height < H; y += 10) {
+          let sum = 0;
+          for (let yy = y; yy < y + height; yy += 4) {
+            for (let x = 0; x < W; x += 4) sum += gray[yy * W + x];
+          }
+          if (sum > bestSum) {
+            bestSum = sum;
+            best = y;
+          }
+        }
+        return { x: 0, y: best, w: W, h: height };
+      }
+
+      function drawCrop(canvas, plane, band) {
+        canvas.width = band.w;
+        canvas.height = band.h;
+        const ctx = canvas.getContext("2d");
+        const img = ctx.createImageData(band.w, band.h);
+        for (let y = 0; y < band.h; y++) {
+          for (let x = 0; x < band.w; x++) {
+            const v = plane[(y + band.y) * W + (x + band.x)];
+            const p = (y * band.w + x) * 4;
+            img.data[p] = img.data[p + 1] = img.data[p + 2] = v;
+            img.data[p + 3] = 255;
+          }
+        }
+        ctx.putImageData(img, 0, 0);
+      }
+    </script>
+  </body>
+</html>
