@@ -176,17 +176,33 @@
           const curve = document.createElement("canvas");
           curve.className = "curve";
           panel.append(curve);
-          const peak = drawCurve(curve, cand);
+          drawCurve(curve, cand);
+
+          // Mirror-image candidates have an identical peak magnitude, so the
+          // size of the shift alone cannot tell c=-0.3 from c=+0.3. What
+          // separates them is which side of the frame gets the work.
+          const shift = shiftProfile(cand);
 
           const cap = document.createElement("div");
           cap.className = "cap";
           const params =
             cand.theta < 1e-4
               ? `<span class="prm">axis=${cand.axis} &nbsp;t=0 (identity) &nbsp;&middot;&nbsp; shifts nothing</span>`
-              : `<span class="prm">axis=${cand.axis} &nbsp;t=${cand.theta} &nbsp;c=${cand.center} &nbsp;(${Math.round((cand.theta * 180) / Math.PI)}&deg;) &nbsp;&middot;&nbsp; shifts up to ${peak.toFixed(0)}px</span>`;
+              : `<span class="prm">axis=${cand.axis} &nbsp;t=${cand.theta} &nbsp;c=${cand.center} &nbsp;(${Math.round((cand.theta * 180) / Math.PI)}&deg;)<br>${
+                  cand.center === 0
+                    ? "symmetric, both sides equally"
+                    : `straightens the <b>${shift.side.toUpperCase()}</b> side`
+                } &middot; up to ${Math.abs(shift.peak).toFixed(0)}px</span>`;
           const timing = `<span class="prm">warp ${warpMs.toFixed(1)}ms &middot; decode ${(totalMs - warpMs).toFixed(1)}ms</span>`;
+          const hits = found
+            .map((f) => {
+              const xs = f.corners.map((p) => p.x);
+              const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
+              return `✓ ${cx < W / 2 ? "LEFT" : "RIGHT"} label: ${f.text.slice(0, 16)}`;
+            })
+            .join("<br>");
           cap.innerHTML = found.length
-            ? `${params}<br>${timing}<br><b>✓ ${found.map((f) => f.text.slice(0, 18)).join(", ")}</b>`
+            ? `${params}<br>${timing}<br><b>${hits}</b>`
             : `${params}<br>${timing}<br><span class="miss">nothing</span>`;
           panel.append(cap);
 
@@ -274,6 +290,24 @@
         }
         ctx.stroke();
         return peak;
+      }
+
+      // Where this correction does its heaviest work. With c off centre the
+      // peak sits at the far edge, not mid-frame: shifting the assumed near
+      // edge left makes the RIGHT of the frame the far-wrapped part, so that
+      // is the side that gets straightened.
+      function shiftProfile(cand) {
+        const table = sampleTable(cand, W);
+        let peak = 0;
+        let at = 0;
+        for (let i = 0; i < W; i++) {
+          const d = table[i] - i;
+          if (Math.abs(d) > Math.abs(peak)) {
+            peak = d;
+            at = i;
+          }
+        }
+        return { peak, at, side: at < W / 2 ? "left" : "right" };
       }
 
       function brightestBand(gray, height) {
