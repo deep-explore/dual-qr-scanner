@@ -1,8 +1,9 @@
 // Decode pipeline: grayscale -> candidate dewarp -> ZXing.
-// Shared by the scanner worker and the self-test page.
+// Shared by the scanner worker, the still-image path and the test pages.
 
 import { prepareZXingModule, readBarcodes } from "./vendor/zxing/reader/index.js";
 import { CANDIDATES, dewarpGray, toSourcePoint } from "./dewarp.js";
+import { MAX_CODES, isComplete, mergeFrameResults } from "./policy.js";
 
 const WASM_URL = new URL("./vendor/zxing/zxing_reader.wasm", import.meta.url).href;
 
@@ -14,7 +15,7 @@ prepareZXingModule({
 
 const READER_OPTIONS = {
   formats: ["QRCode", "MicroQRCode"],
-  maxNumberOfSymbols: 2,
+  maxNumberOfSymbols: MAX_CODES,
   tryHarder: true,
   tryInvert: true,
   tryRotate: true,
@@ -45,10 +46,13 @@ function grayToImageData(gray, width, height, scratch) {
  * Run one dewarp candidate over a grayscale frame.
  * Detection corners are mapped back to source coordinates so the caller can
  * outline them on the untouched preview.
+ *
+ * `scratch` (RGBA) and `plane` (grayscale) are reused across calls to keep the
+ * scan loop free of per-frame allocation.
  */
-export async function decodeWithCandidate(gray, width, height, cand, scratch) {
-  const plane = dewarpGray(gray, width, height, cand);
-  const results = await readBarcodes(grayToImageData(plane, width, height, scratch), READER_OPTIONS);
+export async function decodeWithCandidate(gray, width, height, cand, scratch, plane) {
+  const straightened = dewarpGray(gray, width, height, cand, plane);
+  const results = await readBarcodes(grayToImageData(straightened, width, height, scratch), READER_OPTIONS);
   return results.map((r) => ({
     text: r.text,
     bytes: r.bytes,
@@ -61,19 +65,30 @@ export async function decodeWithCandidate(gray, width, height, cand, scratch) {
 }
 
 /**
- * Sweep every candidate until one pass returns `want` codes. Used by the
- * self-test and by still-image scanning, where there is no next frame to
- * spread the work across.
+ * Sweep one frame, merging what each candidate finds.
+ *
+ * A single global warp cannot straighten a whole cylinder, so two labels on
+ * the same bottle typically need two different candidates — but both readings
+ * come from this one frame, which is what the pairing rule requires.
+ *
+ * `order` lets a caller try previously successful candidates first.
  */
-export async function decodeSweep(gray, width, height, want = 2) {
-  const scratch = new Uint8ClampedArray(width * height * 4);
-  let best = [];
-  for (const cand of CANDIDATES) {
-    const found = await decodeWithCandidate(gray, width, height, cand, scratch);
-    if (found.length > best.length) best = found;
-    if (best.length >= want) break;
+export async function sweepFrame(gray, width, height, { order = CANDIDATES, scratch, plane } = {}) {
+  const rgba = scratch ?? new Uint8ClampedArray(width * height * 4);
+  const merged = new Map();
+  const winners = [];
+
+  for (const cand of order) {
+    const found = await decodeWithCandidate(gray, width, height, cand, rgba, plane);
+    if (found.length) {
+      const before = merged.size;
+      mergeFrameResults(merged, found);
+      if (merged.size > before) winners.push(cand);
+    }
+    if (isComplete([...merged.keys()])) break;
   }
-  return best;
+
+  return { results: [...merged.values()], winners };
 }
 
 export { CANDIDATES };

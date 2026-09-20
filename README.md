@@ -52,28 +52,49 @@ resampling the source at `sin()` of evenly spaced output angles — that is
 Three unknowns: how far the label wraps (`theta`), where the cylinder's near
 line sits (`center`, since you never aim perfectly), and whether the cylinder
 stands up or lies down (`axis`). So the scanner sweeps 19 combinations. It
-tries two per frame — the one that last worked, plus the next in a rolling
-cycle — which covers the whole set in well under a second of handheld video
-without stalling the preview. Once a curvature works it is tried first on every
-later frame.
+sweeps them inside the worker, where blocking costs nothing visible because the
+preview runs on the main thread. A frame carrying both codes finishes in
+30–70 ms; a frame with nothing in it costs a full sweep, about 130 ms.
 
-One dewarp is applied to the whole frame, so a single correction straightens
-both codes at once.
+**One warp does not straighten a whole bottle.** This was the assumption the
+real photographs killed. Each label sits at its own angle around the
+circumference, so no single global correction fits both at once: on every
+reference bottle the left label is recovered by a `center = -0.3` candidate and
+the right one by `center = +0.3`, of the *same* frame. The scanner therefore
+merges what the candidates find within one frame instead of hunting for one
+perfect warp. `center` turned out to be the decisive parameter — it effectively
+chooses which part of the curved surface gets corrected.
 
 **Why a sweep and not curvature estimation:** the self-test bends a card by
 1.15 rad and the winning candidate is the 0.7 rad one. Partial correction is
 enough to bring the code back inside the decoder's own tolerance, so a coarse
 sweep beats an expensive exact fit.
 
-**Two codes, one frame.** A result set only ever comes from a single decode
-pass — pairs are never stitched together across frames, so two codes reported
-together were genuinely in view together. A lone code is still accepted, but
-only after a 1.4 s settle window in which a pass carrying two would win. In
-testing the second code lands about 100 ms after the first, well inside that
-window.
+**Device orientation prunes the search.** While the phone is held upright,
+world-up is image-up and a standing bottle has a vertical axis, so the
+horizontal-axis half of the sweep is skipped — an empty frame costs 74 ms
+instead of 131 ms. Tilt the phone flat, or run where motion events are
+unavailable (a desktop, or iOS where the app never asks for permission), and
+the full set is tried again. It only ever prunes; it never changes what a
+successful frame reports.
+
+**Two codes, one frame.** A reported pair always comes from one captured frame,
+so two codes shown together were genuinely in view together. That is a claim
+about the frame, not about one decode pass — which is exactly why merging
+across candidates within a frame is still strict. Nothing is ever stitched
+together across frames. A lone code is accepted only after a 1.4 s settle
+window in which a frame carrying both would win.
 
 **Offline.** `sw.js` precaches the whole app (~1 MB) on install and serves
-cache-first.
+cache-first. Each asset is fetched individually so a failure can name the file
+that broke, and a partial precache fails the install rather than leaving the
+app looking fine until the network disappears.
+
+**Failing loudly.** An installed PWA has no console, so anything the user needs
+to know goes to the status line. A watchdog notices when a scan stops making
+progress — a wedged frame, a dead capture loop, a decoder that never loaded all
+look identical from the outside — and says so instead of showing a live preview
+that quietly decodes nothing.
 
 ## Checks
 
@@ -96,18 +117,38 @@ Measured on the reference fixtures:
 | 1.3 rad (74°) | 0/2 | 2/2 |
 | 1.5 rad (86°) | 0/2 | 2/2 |
 
-Synthetic images are a best case — real labels add glare, blur and perspective
-— but the shape of the result holds: ZXing manages gentle curves by itself, and
-the dewarp is what rescues the hard ones.
+Synthetic images are a best case, and that test is partly circular: it bends
+the card with the exact inverse of the transform used to straighten it, so it
+proves the implementation, not the model. The real check is below.
+
+### Real photographs
+
+`test/bench.html` runs actual photographs of a labelled glass reagent bottle —
+two paper labels wrapped around the curve — through the same pipeline, and
+fails if any of them does not give up both codes. The photographs live in
+`test/` and are never precached, so they add nothing to the offline payload.
+
+| | no dewarp | swept |
+| --- | --- | --- |
+| 5 bottle photos @ 1080 | **0/2 on every one** | **2/2 on every one** |
+
+Without the dewarp the decoder reads nothing at all on these — the failure that
+motivated the app. Winning candidates are always vertical-axis and always
+off-centre, in pairs like `v-t0.7-c-0.3` + `v-t0.7-c0.3`.
+
+Resolution is not a free parameter here: at a 720 px long edge one of the five
+bottles goes from 2/2 to 0/2, which is why `PROCESS_MAX` is 1080. 1440 costs
+more and reads no more.
 
 ## Tuning
 
 | What | Where |
 | ---- | ----- |
-| Curvatures tried | `CANDIDATES` in `dewarp.js` |
-| Decode attempts per frame | `ATTEMPTS_PER_FRAME` in `decode-worker.js` |
-| Settle window before accepting one code | `SETTLE_MS` in `app.js` |
+| Curvatures and centres tried | `CANDIDATES` in `dewarp.js` |
+| What counts as a finished scan | `policy.js` (`MAX_CODES`, `SETTLE_MS`) |
+| Axis pruning from device tilt | `orientation.js` |
 | Frame resolution handed to the decoder | `PROCESS_MAX` in `app.js` |
+| Stall detection | `STALL_MS` in `app.js` |
 | Barcode formats, symbol cap | `READER_OPTIONS` in `pipeline.js` |
 
 After changing any shipped file, bump `CACHE` in `sw.js` so installed copies

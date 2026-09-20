@@ -1,9 +1,17 @@
 // Camera, frame pump, and result handling.
 
-const PROCESS_MAX = 720; // long edge of the frame handed to the decoder
-const SETTLE_MS = 1400; // after finding one code, keep looking for a second
+import { MAX_CODES, PairingPolicy } from "./policy.js";
+import { createAxisHint } from "./orientation.js";
+
+// Dense codes on a curved label need the resolution: on the reference
+// photographs 720 loses one bottle entirely, 1080 reads all five, and 1440
+// costs more for nothing.
+const PROCESS_MAX = 1080;
 const HISTORY_KEY = "qr-scan-history";
 const HISTORY_MAX = 50;
+// No decode has come back in this long: something is wedged.
+const STALL_MS = 4000;
+const PERSISTENT_ERRORS = 8;
 
 const els = {
   video: document.getElementById("video"),
@@ -24,6 +32,8 @@ const els = {
 const frameCanvas = document.createElement("canvas");
 const frameCtx = frameCanvas.getContext("2d", { willReadFrequently: true });
 const overlayCtx = els.overlay.getContext("2d");
+const policy = new PairingPolicy();
+const axisHint = createAxisHint();
 
 let worker = null;
 let stream = null;
@@ -32,7 +42,9 @@ let facingMode = "environment";
 let pendingFrame = false;
 let frameSeq = 0;
 let settleTimer = null;
-let settleBest = [];
+let watchdog = null;
+let lastResultAt = 0;
+let resultsSeen = 0;
 let lastScale = { x: 1, y: 1 };
 
 function setStatus(text, kind = "") {
@@ -45,19 +57,28 @@ function getWorker() {
   worker = new Worker(new URL("./decode-worker.js", import.meta.url), { type: "module" });
   worker.onmessage = (e) => {
     const msg = e.data;
-    if (msg.type === "error") {
-      console.error("decoder:", msg.message);
+    if (msg.type !== "result") return;
+    pendingFrame = false;
+    lastResultAt = performance.now();
+    resultsSeen++;
+
+    // Decoder trouble belongs on screen: an installed PWA has no console.
+    if (msg.errorCount >= PERSISTENT_ERRORS) {
+      stopScan();
+      setStatus(`Decoder keeps failing: ${msg.error ?? "unknown error"}`, "error");
       return;
     }
-    if (msg.type === "result") {
-      pendingFrame = false;
-      handleResults(msg.results, msg.candidate);
-    }
+    if (msg.error) setStatus(`Decode error: ${msg.error}`, "error");
+
+    handleFrame(msg.results, msg.winners);
   };
   worker.onerror = (err) => {
-    console.error("worker failed", err);
-    setStatus("Decoder failed to start. Reload the app.", "error");
+    setStatus(`Decoder failed to start: ${err?.message ?? "unknown error"}`, "error");
     stopScan();
+  };
+  worker.onmessageerror = () => {
+    setStatus("Decoder sent an unreadable message.", "error");
+    pendingFrame = false;
   };
   return worker;
 }
@@ -65,6 +86,7 @@ function getWorker() {
 async function startScan() {
   if (scanning) return;
   clearResults();
+  policy.reset();
   setStatus("Starting camera…");
   try {
     stream = await navigator.mediaDevices.getUserMedia({
@@ -84,16 +106,19 @@ async function startScan() {
   els.video.srcObject = stream;
   await els.video.play();
   scanning = true;
+  resultsSeen = 0;
   getWorker().postMessage({ type: "reset" });
   document.body.classList.add("scanning");
-  setStatus("Point at the code… curved labels take a moment.");
+  setStatus("Point at the codes… curved labels take a moment.");
   updateTorchButton();
+  startWatchdog();
   pump();
 }
 
 function cameraError(err) {
   if (err?.name === "NotAllowedError") return "Camera permission denied. Allow it in your browser settings.";
   if (err?.name === "NotFoundError") return "No camera found on this device.";
+  if (err?.name === "NotReadableError") return "Camera is busy in another app. Close it and try again.";
   if (!window.isSecureContext) return "Camera needs HTTPS. Open the GitHub Pages URL, not a file:// path.";
   return `Could not start camera: ${err?.message ?? err}`;
 }
@@ -110,6 +135,27 @@ function stopScan() {
   overlayCtx.clearRect(0, 0, els.overlay.width, els.overlay.height);
   clearTimeout(settleTimer);
   settleTimer = null;
+  clearInterval(watchdog);
+  watchdog = null;
+}
+
+// The app has no other way to notice that it has silently stopped working:
+// a wedged frame, a dead pump and a decoder that never loaded all look
+// identical from here — nothing arrives.
+function startWatchdog() {
+  lastResultAt = performance.now();
+  clearInterval(watchdog);
+  watchdog = setInterval(() => {
+    if (!scanning || performance.now() - lastResultAt < STALL_MS) return;
+    if (resultsSeen === 0) {
+      setStatus("Decoder is not responding. It may have failed to load — try reloading.", "error");
+    } else {
+      setStatus("Scanner stalled, restarting…", "error");
+    }
+    lastResultAt = performance.now();
+    pendingFrame = false; // release a frame that never came back
+    pump(); // restart the loop if it died
+  }, 1000);
 }
 
 function pump() {
@@ -123,65 +169,73 @@ function pump() {
     }
   };
 
-  if (pendingFrame || els.video.readyState < 2) return next();
+  // Whatever happens below, the loop has to schedule its own next turn or the
+  // scanner dies without a sound.
+  try {
+    if (pendingFrame || els.video.readyState < 2) return;
 
-  const vw = els.video.videoWidth;
-  const vh = els.video.videoHeight;
-  if (!vw || !vh) return next();
+    const vw = els.video.videoWidth;
+    const vh = els.video.videoHeight;
+    if (!vw || !vh) return;
 
-  const scale = Math.min(1, PROCESS_MAX / Math.max(vw, vh));
-  const w = Math.round(vw * scale);
-  const h = Math.round(vh * scale);
-  if (frameCanvas.width !== w || frameCanvas.height !== h) {
-    frameCanvas.width = w;
-    frameCanvas.height = h;
+    const scale = Math.min(1, PROCESS_MAX / Math.max(vw, vh));
+    const w = Math.round(vw * scale);
+    const h = Math.round(vh * scale);
+    if (frameCanvas.width !== w || frameCanvas.height !== h) {
+      frameCanvas.width = w;
+      frameCanvas.height = h;
+    }
+    frameCtx.drawImage(els.video, 0, 0, w, h);
+    const image = frameCtx.getImageData(0, 0, w, h);
+    lastScale = { x: vw / w, y: vh / h };
+
+    pendingFrame = true;
+    getWorker().postMessage(
+      {
+        type: "frame",
+        id: ++frameSeq,
+        buffer: image.data.buffer,
+        width: w,
+        height: h,
+        axisHint: axisHint.get(),
+      },
+      [image.data.buffer],
+    );
+  } catch (err) {
+    pendingFrame = false;
+    setStatus(`Frame capture failed: ${err?.message ?? err}`, "error");
+  } finally {
+    next();
   }
-  frameCtx.drawImage(els.video, 0, 0, w, h);
-  const image = frameCtx.getImageData(0, 0, w, h);
-  lastScale = { x: vw / w, y: vh / h };
-
-  pendingFrame = true;
-  getWorker().postMessage({ type: "frame", id: ++frameSeq, buffer: image.data.buffer, width: w, height: h }, [
-    image.data.buffer,
-  ]);
-  next();
 }
 
-// Strict single-frame pairing: a result set only ever comes from one decode
-// pass, never stitched together across frames. A lone code still counts, but
-// only after a short settle window in which a pass carrying two would win.
-function handleResults(results, candidate) {
+function handleFrame(results, winners) {
   if (!scanning) return;
   drawOverlay(results);
 
-  if (results.length >= 2) {
+  const decision = policy.offer(results, winners);
+  if (decision.action === "accept") {
     clearTimeout(settleTimer);
     settleTimer = null;
-    accept(results.slice(0, 2), candidate);
+    accept(decision.results, decision.candidates);
     return;
   }
-
-  if (results.length === 1) {
-    settleBest = results;
-    if (!settleTimer) {
-      setStatus("Found one — checking for a second…");
-      settleTimer = setTimeout(() => {
-        settleTimer = null;
-        if (scanning) accept(settleBest, candidate);
-      }, SETTLE_MS);
-    }
+  if (decision.action === "wait" && !settleTimer) {
+    setStatus("Found one — checking for a second…");
+    settleTimer = setTimeout(() => {
+      settleTimer = null;
+      const settled = policy.expire();
+      if (scanning && settled.action === "accept") accept(settled.results, settled.candidates);
+    }, decision.waitMs);
   }
 }
 
-function accept(results, candidate) {
+function accept(results, candidates) {
   stopScan();
-  if (navigator.vibrate) navigator.vibrate(results.length >= 2 ? [40, 60, 40] : 40);
-  renderResults(results, candidate);
+  if (navigator.vibrate) navigator.vibrate(results.length >= MAX_CODES ? [40, 60, 40] : 40);
+  renderResults(results, candidates);
   addHistory(results);
-  setStatus(
-    results.length >= 2 ? "Two codes captured in one frame." : "One code captured.",
-    "ok",
-  );
+  setStatus(results.length >= MAX_CODES ? "Two codes captured in one frame." : "One code captured.", "ok");
 }
 
 function drawOverlay(results) {
@@ -221,8 +275,9 @@ function clearResults() {
   els.results.innerHTML = "";
 }
 
-function renderResults(results, candidate) {
+function renderResults(results, candidates) {
   clearResults();
+  const dewarped = Array.isArray(candidates) && candidates.some((c) => c?.theta > 0);
   results.forEach((r, i) => {
     const card = document.createElement("div");
     card.className = "card";
@@ -230,7 +285,7 @@ function renderResults(results, candidate) {
     const head = document.createElement("div");
     head.className = "card-head";
     head.innerHTML = `<span class="tag">Code ${i + 1}</span><span class="meta">${escapeHtml(r.format)}${
-      candidate && candidate.theta > 0 ? " · dewarped" : ""
+      dewarped ? " · dewarped" : ""
     }</span>`;
 
     const body = document.createElement("div");
@@ -339,15 +394,15 @@ async function scanPhoto(file) {
   const image = frameCtx.getImageData(0, 0, w, h);
   bitmap.close();
 
-  const { decodeSweep, toGray } = await import("./pipeline.js");
-  const results = await decodeSweep(toGray(image.data, w, h), w, h, 2);
+  const { sweepFrame, toGray } = await import("./pipeline.js");
+  const { results, winners } = await sweepFrame(toGray(image.data, w, h), w, h);
   if (!results.length) {
     setStatus("No QR code found in that image.", "error");
     return;
   }
-  renderResults(results.slice(0, 2), null);
-  addHistory(results.slice(0, 2));
-  setStatus(results.length >= 2 ? "Two codes found in the image." : "One code found in the image.", "ok");
+  renderResults(results, winners);
+  addHistory(results);
+  setStatus(results.length >= MAX_CODES ? "Two codes found in the image." : "One code found in the image.", "ok");
 }
 
 function updateTorchButton() {
@@ -397,9 +452,14 @@ renderHistory();
 setStatus("Ready. Tap Scan to start.");
 
 if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.addEventListener("message", (e) => {
+    if (e.data?.type !== "precache-failed") return;
+    const names = e.data.failures.map((f) => f.asset).join(", ");
+    setStatus(`Offline cache incomplete — will not work offline. Failed: ${names}`, "error");
+  });
   window.addEventListener("load", () => {
     navigator.serviceWorker.register(new URL("./sw.js", import.meta.url)).catch((err) => {
-      console.warn("Service worker registration failed", err);
+      if (!scanning) setStatus(`Offline support unavailable: ${err?.message ?? err}`, "error");
     });
   });
 }

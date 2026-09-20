@@ -1,81 +1,93 @@
-// Scanner worker: keeps the dewarp sweep off the UI thread.
+// Scanner worker: sweeps one whole frame per message.
 //
-// The frame budget only allows a couple of decodes, so instead of trying all
-// 19 dewarp candidates every frame we try two: the one that last worked (the
-// flat pass, until something else proves better) and the next one in a rolling
-// cycle. A whole sweep therefore completes in well under a second of handheld
-// video, and once a curvature locks on it is re-tried first on every frame.
+// Blocking here costs nothing visible — the preview runs on the main thread —
+// so there is no per-frame attempt budget and no scheduler. The worker takes a
+// frame, sweeps candidates until it has both codes, and answers. On the
+// reference photographs that lands in 30-60 ms; a frame with nothing in it
+// costs a full sweep, a few hundred ms.
+//
+// Two orderings keep the common case at the front: candidates that worked on
+// the previous frame, then the axis the device says is upright.
 
-import { CANDIDATES, decodeWithCandidate, toGray } from "./pipeline.js";
+import { CANDIDATES, sweepFrame, toGray } from "./pipeline.js";
 
-const ATTEMPTS_PER_FRAME = 2;
-const FORGET_AFTER_EMPTY_FRAMES = 45;
+const ERROR_REPORT_INTERVAL_MS = 2000;
 
-let preferred = 0;
-let cycle = 0;
-let emptyStreak = 0;
 let scratch = null;
+let plane = null;
+let recent = []; // candidate ids that produced a result last time
+let lastErrorAt = 0;
+let errorCount = 0;
 
 self.onmessage = async (e) => {
   const msg = e.data;
   if (msg.type === "reset") {
-    preferred = 0;
-    cycle = 0;
-    emptyStreak = 0;
+    recent = [];
+    errorCount = 0;
     return;
   }
   if (msg.type !== "frame") return;
 
-  const { id, buffer, width, height } = msg;
+  const { id, width, height, axisHint } = msg;
   const started = performance.now();
-  const gray = toGray(new Uint8ClampedArray(buffer), width, height);
-  if (!scratch || scratch.length !== width * height * 4) {
-    scratch = new Uint8ClampedArray(width * height * 4);
-  }
+  let results = [];
+  let winners = [];
+  let failure = null;
 
-  const tried = new Set();
-  let best = [];
-  let bestIndex = preferred;
-
-  for (let n = 0; n < ATTEMPTS_PER_FRAME; n++) {
-    const index = n === 0 ? preferred : nextCycleIndex(tried);
-    if (tried.has(index)) continue;
-    tried.add(index);
-
-    let found = [];
-    try {
-      found = await decodeWithCandidate(gray, width, height, CANDIDATES[index], scratch);
-    } catch (err) {
-      self.postMessage({ type: "error", message: String(err?.message ?? err) });
+  // Everything that could throw lives in here: a frame that never answers
+  // would wedge the main thread's pump forever.
+  try {
+    const gray = toGray(new Uint8ClampedArray(msg.buffer), width, height);
+    if (!scratch || scratch.length !== width * height * 4) {
+      scratch = new Uint8ClampedArray(width * height * 4);
+      plane = new Uint8ClampedArray(width * height);
     }
-    if (found.length > best.length) {
-      best = found;
-      bestIndex = index;
-    }
-    if (best.length >= 2) break; // a single frame carrying both codes: done
-  }
-
-  if (best.length > 0) {
-    preferred = bestIndex;
-    emptyStreak = 0;
-  } else if (++emptyStreak > FORGET_AFTER_EMPTY_FRAMES) {
-    preferred = 0; // scene changed; fall back to assuming a flat code
-    emptyStreak = 0;
+    const swept = await sweepFrame(gray, width, height, {
+      order: orderCandidates(axisHint),
+      scratch,
+      plane,
+    });
+    results = swept.results;
+    winners = swept.winners;
+    recent = winners.map((c) => c.id);
+    if (results.length) errorCount = 0;
+  } catch (err) {
+    failure = String(err?.message ?? err);
+    errorCount++;
   }
 
   self.postMessage({
     type: "result",
     id,
-    results: best,
-    candidate: CANDIDATES[bestIndex],
+    results,
+    winners,
     ms: Math.round(performance.now() - started),
+    error: reportableError(failure),
+    errorCount,
   });
 };
 
-function nextCycleIndex(tried) {
-  for (let i = 0; i < CANDIDATES.length; i++) {
-    cycle = (cycle + 1) % CANDIDATES.length;
-    if (!tried.has(cycle)) return cycle;
-  }
-  return cycle;
+// The default list already leads with vertical-axis candidates, so ordering by
+// the hint alone would change almost nothing. The hint earns its keep by
+// pruning: a phone held upright is looking at a standing bottle, so the
+// horizontal-axis half of the sweep can go, which is what halves the cost of a
+// frame containing no codes. Without a hint — a desktop, a flat phone, or iOS
+// where we never ask for motion permission — everything is still tried.
+function orderCandidates(axisHint) {
+  const usable = axisHint ? CANDIDATES.filter((c) => c.theta < 1e-4 || c.axis === axisHint) : [...CANDIDATES];
+  const rank = (cand) => {
+    if (recent.includes(cand.id)) return 0;
+    if (cand.theta < 1e-4) return 1; // the flat pass stays cheap and early
+    return 2;
+  };
+  return usable.sort((a, b) => rank(a) - rank(b));
+}
+
+// A broken decoder would otherwise post two messages per frame forever.
+function reportableError(message) {
+  if (!message) return null;
+  const now = performance.now();
+  if (now - lastErrorAt < ERROR_REPORT_INTERVAL_MS) return null;
+  lastErrorAt = now;
+  return message;
 }

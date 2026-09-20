@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Real-image bench</title>
+    <link rel="stylesheet" href="../styles.css" />
+    <style>
+      table { border-collapse: collapse; width: 100%; font-size: 12px; margin-bottom: 8px; }
+      th, td { border: 1px solid var(--line); padding: 5px 7px; text-align: left; vertical-align: top; }
+      th { color: var(--muted); font-weight: 600; }
+      td.ok { color: var(--accent); font-weight: 700; }
+      td.bad { color: var(--danger); font-weight: 700; }
+      .shot { max-width: 110px; border-radius: 6px; border: 1px solid var(--line); float: left; margin: 0 10px 10px 0; }
+      .row { overflow: hidden; margin-bottom: 18px; }
+      code { font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
+      .verdict { font-size: 18px; font-weight: 700; padding: 12px; border-radius: 10px; text-align: center; margin: 14px 0; }
+      .verdict.pass { background: rgba(57, 217, 138, 0.15); color: var(--accent); }
+      .verdict.fail { background: rgba(248, 81, 73, 0.15); color: var(--danger); }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Real-image bench</h1>
+      <p class="sub">Photographs of actual labelled bottles, through the real pipeline</p>
+    </header>
+    <main>
+      <div id="verdict" class="verdict">Running&hellip;</div>
+      <p id="progress" class="status"></p>
+      <div id="out"></div>
+      <p><a class="btn ghost" href="../index.html">Back to scanner</a></p>
+    </main>
+
+    <script type="module">
+      import { decodeWithCandidate, sweepFrame, toGray, CANDIDATES } from "../pipeline.js";
+      import { MAX_CODES } from "../policy.js";
+
+      // Two labels wrapped around a glass reagent bottle. Every one of these
+      // is a frame the scanner is expected to fully read.
+      const IMAGES = [
+        "WhatsApp Image 2026-09-18 at 10.02.37.jpeg",
+        "WhatsApp Image 2026-09-18 at 10.18.14.jpeg",
+        "WhatsApp Image 2026-09-18 at 10.18.22.jpeg",
+        "WhatsApp Image 2026-09-18 at 10.18.54.jpeg",
+        "WhatsApp Image 2026-09-20 at 19.00.07.jpeg",
+      ];
+      // Must track PROCESS_MAX in app.js.
+      const PROCESS_MAX = 1080;
+      const FLAT = CANDIDATES[0];
+
+      const out = document.getElementById("out");
+      const progress = document.getElementById("progress");
+      let failures = 0;
+
+      async function grayAt(bitmap, longEdge) {
+        const scale = Math.min(1, longEdge / Math.max(bitmap.width, bitmap.height));
+        const w = Math.round(bitmap.width * scale);
+        const h = Math.round(bitmap.height * scale);
+        const c = new OffscreenCanvas(w, h);
+        const ctx = c.getContext("2d", { willReadFrequently: true });
+        ctx.drawImage(bitmap, 0, 0, w, h);
+        return { gray: toGray(ctx.getImageData(0, 0, w, h).data, w, h), w, h };
+      }
+
+      for (const name of IMAGES) {
+        progress.textContent = `Decoding ${name}…`;
+        const bitmap = await createImageBitmap(await (await fetch(encodeURIComponent(name))).blob());
+
+        const rows = [];
+        let shipping = null;
+        for (const longEdge of [720, PROCESS_MAX, 1440]) {
+          const { gray, w, h } = await grayAt(bitmap, longEdge);
+          const direct = await decodeWithCandidate(gray, w, h, FLAT);
+          const started = performance.now();
+          const swept = await sweepFrame(gray, w, h);
+          const ms = Math.round(performance.now() - started);
+          if (longEdge === PROCESS_MAX) shipping = swept;
+          rows.push(
+            `<tr><td>${longEdge} <code>(${w}×${h})</code></td>` +
+              `<td class="${direct.length >= MAX_CODES ? "ok" : "bad"}">${direct.length}/${MAX_CODES}</td>` +
+              `<td class="${swept.results.length >= MAX_CODES ? "ok" : "bad"}">${swept.results.length}/${MAX_CODES}</td>` +
+              `<td><code>${swept.winners.map((c) => c.id).join("<br>") || "&mdash;"}</code></td>` +
+              `<td>${ms}</td></tr>`,
+          );
+        }
+
+        const passed = shipping.results.length >= MAX_CODES;
+        if (!passed) failures++;
+
+        const block = document.createElement("div");
+        block.className = "row";
+        block.innerHTML =
+          `<img class="shot" src="${encodeURIComponent(name)}" alt="">` +
+          `<div style="font-size:12px;margin-bottom:6px">` +
+          `<strong style="color:${passed ? "var(--accent)" : "var(--danger)"}">${passed ? "PASS" : "FAIL"}</strong> ` +
+          `&middot; ${name} &middot; ${bitmap.width}×${bitmap.height}</div>` +
+          `<table><tr><th>long edge</th><th>no dewarp</th><th>swept</th><th>winning candidates</th><th>ms</th></tr>${rows.join("")}</table>` +
+          `<div style="font-size:11px;color:var(--muted)"><code>${shipping.results.map((r) => r.text).join("<br>") || "nothing decoded"}</code></div>`;
+        out.append(block);
+        bitmap.close();
+      }
+
+      const verdict = document.getElementById("verdict");
+      verdict.textContent =
+        failures === 0
+          ? `ALL ${IMAGES.length} REAL IMAGES READ BOTH CODES`
+          : `${failures} of ${IMAGES.length} REAL IMAGES FAILED`;
+      verdict.className = `verdict ${failures === 0 ? "pass" : "fail"}`;
+      progress.textContent = "";
+      document.title = failures === 0 ? "bench: PASS" : "bench: FAIL";
+    </script>
+  </body>
+</html>

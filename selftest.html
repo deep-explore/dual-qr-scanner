@@ -74,8 +74,8 @@
 
     <script type="module">
       import { FIXTURES } from "./test/fixtures.js";
-      import { decodeWithCandidate, decodeSweep, toGray, CANDIDATES } from "./pipeline.js";
-      import { warpGray } from "./dewarp.js";
+      import { decodeWithCandidate, sweepFrame, toGray, CANDIDATES } from "./pipeline.js";
+      import { warpGray } from "./test/warp.js";
 
       const MODULE_PX = 6;
       const QUIET = 4;
@@ -178,23 +178,23 @@
           `direct decode found ${warpedFlatResults.length}/2: ${texts(warpedFlatResults).join(" | ") || "none"}`,
         );
 
-        // The thing under test: the sweep must recover both codes.
-        const sweepResults = await decodeSweep(warped, width, height, 2);
+        // The thing under test: one frame, swept across candidates, must give
+        // up both codes.
+        const swept = await sweepFrame(warped, width, height);
         check(
           "Dewarp sweep recovers both codes from the distorted card",
-          sweepResults.length === 2 && same(texts(sweepResults), expected),
-          `found ${sweepResults.length} via candidate "${sweepResults[0]?.candidate ?? "-"}": ${texts(sweepResults).join(" | ") || "none"}`,
+          swept.results.length === 2 && same(texts(swept.results), expected),
+          `found ${swept.results.length} via ${swept.winners.map((c) => c.id).join(" + ") || "-"}: ${texts(swept.results).join(" | ") || "none"}`,
         );
 
-        const winner = CANDIDATES.find((c) => c.id === sweepResults[0]?.candidate);
         check(
           "The win came from a dewarp candidate, not the flat pass",
-          Boolean(winner) && winner.theta > 0,
-          `winning candidate: ${winner?.id ?? "-"} (theta ${winner?.theta ?? "-"})`,
+          swept.winners.length > 0 && swept.winners.some((c) => c.theta > 0),
+          `winning candidates: ${swept.winners.map((c) => `${c.id} (theta ${c.theta})`).join(", ") || "-"}`,
         );
 
-        if (sweepResults[0]) {
-          const cand = CANDIDATES.find((c) => c.id === sweepResults[0].candidate) ?? FLAT;
+        if (swept.winners[0]) {
+          const cand = swept.winners[0];
           const { dewarpGray } = await import("./dewarp.js");
           show(dewarpGray(warped, width, height, cand), width, height, `3. After the winning dewarp candidate (${cand.id})`);
         }
@@ -204,8 +204,8 @@
         for (const theta of [0.5, 0.9, 1.1, 1.3, 1.5]) {
           const img = warpGray(gray, width, height, { id: "s", axis: "v", theta, center: 0 });
           const direct = await decodeWithCandidate(img, width, height, FLAT);
-          const swept = await decodeSweep(img, width, height, 2);
-          survived.push(`${theta}rad: direct ${direct.length}/2, sweep ${swept.length}/2`);
+          const sweep = await sweepFrame(img, width, height);
+          survived.push(`${theta}rad: direct ${direct.length}/2, sweep ${sweep.results.length}/2`);
         }
         note("Curvature range", survived.join(" &middot; "));
 

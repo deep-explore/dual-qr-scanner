@@ -2,7 +2,7 @@
 // — is precached on install, so after the first load the app never needs the
 // network. Bump CACHE when shipping changes.
 
-const CACHE = "dual-qr-v1";
+const CACHE = "dual-qr-v2";
 
 const ASSETS = [
   "./",
@@ -11,6 +11,8 @@ const ASSETS = [
   "./app.js",
   "./pipeline.js",
   "./dewarp.js",
+  "./policy.js",
+  "./orientation.js",
   "./decode-worker.js",
   "./selftest.html",
   "./manifest.webmanifest",
@@ -21,16 +23,42 @@ const ASSETS = [
   "./vendor/zxing/share.js",
   "./vendor/zxing/zxing_reader.wasm",
   "./test/fixtures.js",
+  "./test/warp.js",
 ];
 
 self.addEventListener("install", (event) => {
-  event.waitUntil(
-    caches
-      .open(CACHE)
-      .then((cache) => cache.addAll(ASSETS))
-      .then(() => self.skipWaiting()),
-  );
+  event.waitUntil(precache());
 });
+
+// cache.addAll is all-or-nothing and says nothing about which entry failed, so
+// each asset is fetched on its own and the failures are named. Installing with
+// holes is not an option: the app would look fine until the network went away,
+// so a partial precache fails the install and the browser retries next visit.
+async function precache() {
+  const cache = await caches.open(CACHE);
+  const failures = [];
+
+  await Promise.all(
+    ASSETS.map(async (asset) => {
+      try {
+        await cache.add(new Request(asset, { cache: "reload" }));
+      } catch (err) {
+        failures.push({ asset, message: String(err?.message ?? err) });
+      }
+    }),
+  );
+
+  if (failures.length) {
+    await report(failures);
+    throw new Error(`precache failed for ${failures.length} of ${ASSETS.length} assets`);
+  }
+  await self.skipWaiting();
+}
+
+async function report(failures) {
+  const clients = await self.clients.matchAll({ includeUncontrolled: true, type: "window" });
+  for (const client of clients) client.postMessage({ type: "precache-failed", failures });
+}
 
 self.addEventListener("activate", (event) => {
   event.waitUntil(
@@ -52,7 +80,15 @@ self.addEventListener("fetch", (event) => {
         .then((res) => {
           if (res.ok && res.type === "basic") {
             const copy = res.clone();
-            caches.open(CACHE).then((cache) => cache.put(req, copy));
+            // Keep the worker alive until the write lands, and let a failed
+            // write (quota, eviction) stay a cache miss rather than an
+            // unhandled rejection.
+            event.waitUntil(
+              caches
+                .open(CACHE)
+                .then((cache) => cache.put(req, copy))
+                .catch(() => {}),
+            );
           }
           return res;
         })
