@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Dual QR Scanner</title>
+    <meta name="description" content="Offline QR scanner that reads two codes at once, including codes wrapped around curved surfaces." />
+    <meta name="theme-color" content="#0d1117" />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="icon" href="icons/icon-192.png" />
+    <link rel="apple-touch-icon" href="icons/icon-192.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Dual QR" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Dual QR Scanner</h1>
+      <p class="sub">Two codes, one frame &middot; curved labels &middot; fully offline</p>
+    </header>
+
+    <main>
+      <div class="viewport">
+        <video id="video" playsinline muted autoplay></video>
+        <canvas id="overlay"></canvas>
+        <div class="guide" aria-hidden="true">
+          <span></span><span></span><span></span><span></span>
+        </div>
+      </div>
+
+      <p id="status" class="status">Loading&hellip;</p>
+
+      <div class="controls">
+        <button id="start" class="btn primary">Scan</button>
+        <button id="stop" class="btn">Stop</button>
+        <button id="flip" class="btn ghost" title="Switch camera">Flip</button>
+        <button id="torch" class="btn ghost" title="Torch" aria-pressed="false" hidden>Torch</button>
+        <button id="photo" class="btn ghost" title="Scan a saved photo">Photo</button>
+        <input id="photo-input" type="file" accept="image/*" hidden />
+      </div>
+
+      <section id="results" class="results" aria-live="polite"></section>
+
+      <section id="history-panel" class="history-panel" hidden>
+        <div class="history-head">
+          <h2>History</h2>
+          <button id="clear-history" class="btn ghost small">Clear</button>
+        </div>
+        <ul id="history" class="history"></ul>
+      </section>
+    </main>
+
+    <footer>
+      <p>
+        Hold the curved side facing you and centre the bottle or can &mdash; the
+        scanner sweeps through cylinder curvatures automatically.
+      </p>
+      <p><a href="selftest.html">Run self-test</a></p>
+    </footer>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

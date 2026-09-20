@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Dual QR Scanner &mdash; self-test</title>
+    <link rel="stylesheet" href="styles.css" />
+    <style>
+      .t {
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 10px 12px;
+        margin-bottom: 8px;
+        background: var(--panel);
+      }
+      .t.pass {
+        border-left: 3px solid var(--accent);
+      }
+      .t.fail {
+        border-left: 3px solid var(--danger);
+      }
+      .t .name {
+        font-weight: 600;
+        font-size: 14px;
+      }
+      .t .detail {
+        color: var(--muted);
+        font-size: 12px;
+        margin-top: 3px;
+        font-family: ui-monospace, Menlo, monospace;
+      }
+      .verdict {
+        font-size: 18px;
+        font-weight: 700;
+        padding: 12px;
+        border-radius: 10px;
+        text-align: center;
+        margin: 14px 0;
+      }
+      .verdict.pass {
+        background: rgba(57, 217, 138, 0.15);
+        color: var(--accent);
+      }
+      .verdict.fail {
+        background: rgba(248, 81, 73, 0.15);
+        color: var(--danger);
+      }
+      canvas.preview {
+        width: 100%;
+        max-width: 420px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        image-rendering: pixelated;
+        margin-bottom: 6px;
+      }
+      .cap {
+        font-size: 12px;
+        color: var(--muted);
+        margin: 0 0 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Self-test</h1>
+      <p class="sub">Synthetic cylinder distortion, decoded with the real pipeline</p>
+    </header>
+    <main>
+      <div id="verdict" class="verdict">Running&hellip;</div>
+      <div id="tests"></div>
+      <div id="previews"></div>
+      <p><a class="btn ghost" href="index.html">Back to scanner</a></p>
+    </main>
+
+    <script type="module">
+      import { FIXTURES } from "./test/fixtures.js";
+      import { decodeWithCandidate, decodeSweep, toGray, CANDIDATES } from "./pipeline.js";
+      import { warpGray } from "./dewarp.js";
+
+      const MODULE_PX = 6;
+      const QUIET = 4;
+      // Past where ZXing copes unaided, and deliberately not one of the
+      // sweep's own curvature values.
+      const HARD_THETA = 1.15;
+      const FLAT = CANDIDATES[0];
+
+      const testsEl = document.getElementById("tests");
+      const previewsEl = document.getElementById("previews");
+      let failures = 0;
+
+      function check(name, condition, detail) {
+        const row = document.createElement("div");
+        row.className = `t ${condition ? "pass" : "fail"}`;
+        row.innerHTML = `<div class="name">${condition ? "PASS" : "FAIL"} &middot; ${name}</div><div class="detail">${detail}</div>`;
+        testsEl.append(row);
+        if (!condition) failures++;
+        return condition;
+      }
+
+      function note(name, detail) {
+        const row = document.createElement("div");
+        row.className = "t";
+        row.innerHTML = `<div class="name">INFO &middot; ${name}</div><div class="detail">${detail}</div>`;
+        testsEl.append(row);
+      }
+
+      // Two codes side by side on one white card, mimicking a pair of labels.
+      function buildComposite() {
+        const tile = (FIXTURES[0].width + QUIET * 2) * MODULE_PX;
+        const gap = 10 * MODULE_PX;
+        const width = tile * 2 + gap + 8 * MODULE_PX;
+        const height = tile + 8 * MODULE_PX;
+        const canvas = new OffscreenCanvas(width, height);
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#fff";
+        ctx.fillRect(0, 0, width, height);
+        ctx.fillStyle = "#000";
+
+        FIXTURES.forEach((fx, i) => {
+          const originX = 4 * MODULE_PX + i * (tile + gap) + QUIET * MODULE_PX;
+          const originY = 4 * MODULE_PX + QUIET * MODULE_PX;
+          for (let y = 0; y < fx.height; y++) {
+            for (let x = 0; x < fx.width; x++) {
+              if (fx.bits[y * fx.width + x] === "1") {
+                ctx.fillRect(originX + x * MODULE_PX, originY + y * MODULE_PX, MODULE_PX, MODULE_PX);
+              }
+            }
+          }
+        });
+        const image = ctx.getImageData(0, 0, width, height);
+        return { gray: toGray(image.data, width, height), width, height };
+      }
+
+      function show(gray, width, height, caption) {
+        const canvas = document.createElement("canvas");
+        canvas.className = "preview";
+        canvas.width = width;
+        canvas.height = height;
+        const rgba = new Uint8ClampedArray(width * height * 4);
+        for (let i = 0; i < gray.length; i++) {
+          rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = gray[i];
+          rgba[i * 4 + 3] = 255;
+        }
+        canvas.getContext("2d").putImageData(new ImageData(rgba, width, height), 0, 0);
+        const cap = document.createElement("p");
+        cap.className = "cap";
+        cap.textContent = caption;
+        previewsEl.append(canvas, cap);
+      }
+
+      const texts = (rs) => rs.map((r) => r.text).sort();
+      const expected = FIXTURES.map((f) => f.text).sort();
+      const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
+
+      async function run() {
+        const { gray, width, height } = buildComposite();
+        show(gray, width, height, "1. Flat reference: two codes on one card");
+
+        // Baseline: the undistorted card must give both codes in one pass.
+        const flatResults = await decodeWithCandidate(gray, width, height, FLAT);
+        check(
+          "Flat card decodes both codes in a single pass",
+          flatResults.length === 2 && same(texts(flatResults), expected),
+          `found ${flatResults.length}: ${texts(flatResults).join(" | ") || "none"}`,
+        );
+
+        // Bend it around a cylinder.
+        const bend = { id: "sim", axis: "v", theta: HARD_THETA, center: 0 };
+        const warped = warpGray(gray, width, height, bend);
+        show(warped, width, height, `2. Wrapped around a cylinder (theta = ${HARD_THETA} rad, ~${Math.round((HARD_THETA * 180) / Math.PI)}° half-wrap)`);
+
+        // Premise: at this curvature the decoder alone should be out of road.
+        // If this ever passes, ZXing got better and the sweep matters less.
+        const warpedFlatResults = await decodeWithCandidate(warped, width, height, FLAT);
+        check(
+          "Premise: this curvature defeats the decoder without a dewarp",
+          warpedFlatResults.length < 2,
+          `direct decode found ${warpedFlatResults.length}/2: ${texts(warpedFlatResults).join(" | ") || "none"}`,
+        );
+
+        // The thing under test: the sweep must recover both codes.
+        const sweepResults = await decodeSweep(warped, width, height, 2);
+        check(
+          "Dewarp sweep recovers both codes from the distorted card",
+          sweepResults.length === 2 && same(texts(sweepResults), expected),
+          `found ${sweepResults.length} via candidate "${sweepResults[0]?.candidate ?? "-"}": ${texts(sweepResults).join(" | ") || "none"}`,
+        );
+
+        const winner = CANDIDATES.find((c) => c.id === sweepResults[0]?.candidate);
+        check(
+          "The win came from a dewarp candidate, not the flat pass",
+          Boolean(winner) && winner.theta > 0,
+          `winning candidate: ${winner?.id ?? "-"} (theta ${winner?.theta ?? "-"})`,
+        );
+
+        if (sweepResults[0]) {
+          const cand = CANDIDATES.find((c) => c.id === sweepResults[0].candidate) ?? FLAT;
+          const { dewarpGray } = await import("./dewarp.js");
+          show(dewarpGray(warped, width, height, cand), width, height, `3. After the winning dewarp candidate (${cand.id})`);
+        }
+
+        // Curvature range: how far the sweep holds up.
+        const survived = [];
+        for (const theta of [0.5, 0.9, 1.1, 1.3, 1.5]) {
+          const img = warpGray(gray, width, height, { id: "s", axis: "v", theta, center: 0 });
+          const direct = await decodeWithCandidate(img, width, height, FLAT);
+          const swept = await decodeSweep(img, width, height, 2);
+          survived.push(`${theta}rad: direct ${direct.length}/2, sweep ${swept.length}/2`);
+        }
+        note("Curvature range", survived.join(" &middot; "));
+
+        const verdict = document.getElementById("verdict");
+        verdict.textContent = failures === 0 ? "ALL CHECKS PASSED" : `${failures} CHECK(S) FAILED`;
+        verdict.className = `verdict ${failures === 0 ? "pass" : "fail"}`;
+        document.title = failures === 0 ? "self-test: PASS" : "self-test: FAIL";
+      }
+
+      run().catch((err) => {
+        check("Self-test ran without throwing", false, String(err?.stack ?? err));
+        const verdict = document.getElementById("verdict");
+        verdict.textContent = "SELF-TEST ERRORED";
+        verdict.className = "verdict fail";
+        document.title = "self-test: FAIL";
+      });
+    </script>
+  </body>
+</html>

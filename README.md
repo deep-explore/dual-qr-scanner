@@ -1,0 +1,139 @@
+# Dual QR Scanner
+
+An installable, fully offline QR scanner that reads **two codes from a single
+frame** and copes with codes **wrapped around curved surfaces** — bottles, cans,
+pipes, cable labels.
+
+No build step, no npm install, no network at runtime. Push it to GitHub Pages
+and install it from the browser.
+
+## Deploying to GitHub Pages
+
+```bash
+git remote add origin git@github.com:<you>/<repo>.git
+git push -u origin main
+```
+
+Then in the repository: **Settings → Pages → Source: Deploy from a branch →
+`main` / `/ (root)` → Save**. The app appears at
+`https://<you>.github.io/<repo>/` within a minute or so.
+
+Every path in the app is relative, so serving from a `/<repo>/` subpath works
+without configuration.
+
+## Installing on your phone
+
+Open the Pages URL on the phone, then:
+
+- **Android / Chrome** — "Add to Home screen" from the ⋮ menu, or the install
+  prompt.
+- **iOS / Safari** — Share → "Add to Home Screen". Must be Safari; other iOS
+  browsers cannot install PWAs.
+
+Load it once with a connection. After that everything — including the 950 KB
+decoder — is in the service worker cache and it runs in airplane mode.
+
+The camera needs HTTPS, which GitHub Pages provides. Opening `index.html` as a
+`file://` path will not work.
+
+## How it works
+
+**Decoder.** ZXing-C++ compiled to WebAssembly (`vendor/zxing/`, reader build
+only). Its `maxNumberOfSymbols` option is what caps results at two, and it
+reports corner coordinates so detections can be outlined on the preview.
+
+**Curved codes.** A label wrapped on a cylinder of radius `R` projects a point
+at angle `t` from the near line to screen offset `R·sin(t)`, while its real
+position on the flattened label is the arc length `R·t`. The picture is
+therefore squeezed towards the silhouette edges, and undoing it means
+resampling the source at `sin()` of evenly spaced output angles — that is
+`dewarp.js`.
+
+Three unknowns: how far the label wraps (`theta`), where the cylinder's near
+line sits (`center`, since you never aim perfectly), and whether the cylinder
+stands up or lies down (`axis`). So the scanner sweeps 19 combinations. It
+tries two per frame — the one that last worked, plus the next in a rolling
+cycle — which covers the whole set in well under a second of handheld video
+without stalling the preview. Once a curvature works it is tried first on every
+later frame.
+
+One dewarp is applied to the whole frame, so a single correction straightens
+both codes at once.
+
+**Why a sweep and not curvature estimation:** the self-test bends a card by
+1.15 rad and the winning candidate is the 0.7 rad one. Partial correction is
+enough to bring the code back inside the decoder's own tolerance, so a coarse
+sweep beats an expensive exact fit.
+
+**Two codes, one frame.** A result set only ever comes from a single decode
+pass — pairs are never stitched together across frames, so two codes reported
+together were genuinely in view together. A lone code is still accepted, but
+only after a 1.4 s settle window in which a pass carrying two would win. In
+testing the second code lands about 100 ms after the first, well inside that
+window.
+
+**Offline.** `sw.js` precaches the whole app (~1 MB) on install and serves
+cache-first.
+
+## Checks
+
+```bash
+node scripts/check-assets.mjs   # every precached asset exists; nothing shipped is unlisted
+```
+
+Then open `selftest.html` (on the phone too, if you like). It builds a card
+carrying two QR codes, bends it around a synthetic cylinder past the point
+where the decoder copes alone, and asserts the dewarp sweep gets both payloads
+back. It also prints the curvature range it survives.
+
+Measured on the reference fixtures:
+
+| half-wrap | decoder alone | with dewarp sweep |
+| --------- | ------------- | ----------------- |
+| 0.5 rad (29°) | 2/2 | 2/2 |
+| 0.9 rad (52°) | 2/2 | 2/2 |
+| 1.1 rad (63°) | 0/2 | 2/2 |
+| 1.3 rad (74°) | 0/2 | 2/2 |
+| 1.5 rad (86°) | 0/2 | 2/2 |
+
+Synthetic images are a best case — real labels add glare, blur and perspective
+— but the shape of the result holds: ZXing manages gentle curves by itself, and
+the dewarp is what rescues the hard ones.
+
+## Tuning
+
+| What | Where |
+| ---- | ----- |
+| Curvatures tried | `CANDIDATES` in `dewarp.js` |
+| Decode attempts per frame | `ATTEMPTS_PER_FRAME` in `decode-worker.js` |
+| Settle window before accepting one code | `SETTLE_MS` in `app.js` |
+| Frame resolution handed to the decoder | `PROCESS_MAX` in `app.js` |
+| Barcode formats, symbol cap | `READER_OPTIONS` in `pipeline.js` |
+
+After changing any shipped file, bump `CACHE` in `sw.js` so installed copies
+pick the change up.
+
+## Regenerating assets
+
+```bash
+node scripts/make-icons.mjs                      # PWA icons, no image libraries
+npm install zxing-wasm@3.1.4 --no-save && \
+  node scripts/make-fixtures.mjs                 # self-test QR fixtures
+```
+
+## If it struggles on a real object
+
+Fill the frame with the object and keep the curved side facing you — the
+correction assumes the cylinder's near line is roughly centred. Glare across a
+finder pattern is the usual culprit; ZXing tolerates curvature better than it
+tolerates a blown-out corner.
+
+If real-world results disappoint, the upgrade path is OpenCV's WeChat detector
+(CNN-based, markedly better on distorted codes, also multi-code). It has a
+browser build but costs ~8–10 MB of precache. `pipeline.js` is the only file
+that talks to the decoder, so swapping it is contained.
+
+## Licence
+
+App code: do as you like. Bundled decoder: ZXing-C++ under Apache-2.0, see
+`vendor/zxing/LICENSE`.
