@@ -25,6 +25,8 @@
       th, td { border: 1px solid var(--line); padding: 5px 8px; text-align: left; }
       th { color: var(--muted); font-weight: 600; }
       td.num { text-align: right; font-family: ui-monospace, Menlo, monospace; }
+      tr.skip td { opacity: 0.45; }
+      td .miss { color: var(--muted); }
       .env { color: var(--muted); font-size: 11px; margin-top: 6px; }
     </style>
   </head>
@@ -82,7 +84,42 @@
       </p>
       <div id="grid" class="grid"></div>
 
-      <h2>4. Performance</h2>
+      <h2>4. The loop that drives them</h2>
+      <p class="note">
+        Those corrections are not tried at random. Each captured frame is swept
+        in order until the pair is complete, and only then is the frame let go.
+        The whole cycle:
+      </p>
+      <pre>
+<span class="hl">capture</span> one frame from the preview       main thread, ~0.7 MP
+   |
+   +-> hand it to the worker ------------  preview keeps drawing meanwhile
+        |
+        <span class="hl">for each correction, in order:</span>       recent winners first,
+        |    un-bend the ORIGINAL frame     then the flat pass,
+        |    decode                         then the rest
+        |    pool any new payload
+        |    <span class="hl">stop early once 2 are pooled</span>
+        |
+        +-> answer, always, even on error   a silent frame would wedge the pump
+   |
+   <span class="hl">2 codes</span> -> accept, vibrate, done
+   <span class="hl">1 code</span>  -> hold it, keep sweeping fresh frames for 1.4s;
+              a frame carrying two still wins. Then accept the one.
+   <span class="hl">0 codes</span> -> capture the next frame
+
+  A watchdog runs alongside: no answer for 4s and it says so on screen,
+  releases the frame and restarts the loop.</pre>
+      <p class="note">
+        Two rules hide in there. Corrections always re-sample the
+        <em>original</em> frame, never an already-corrected one, so distortions
+        never stack. And payloads are only ever pooled <em>within</em> a single
+        frame &mdash; never across frames &mdash; so a reported pair was genuinely
+        in view at one instant.
+      </p>
+      <div id="loop"></div>
+
+      <h2>5. Performance</h2>
       <div id="perf"></div>
 
       <p><a class="btn ghost" href="../index.html">Back to scanner</a></p>
@@ -211,9 +248,49 @@
           done++;
         }
 
+        renderLoop(rows);
         renderPerf(rows, vertical.length);
         status.textContent = "Each panel is the same photo, un-bent a different way.";
         status.className = "status ok";
+      }
+
+      // The sweep as it actually ran on this photo, step by step, with the
+      // running cost. On a first frame there is no history yet, so the order is
+      // simply the flat pass and then the list.
+      function renderLoop(rows) {
+        const pooled = new Set();
+        let running = 0;
+        let stopped = false;
+        const lines = rows.map((r, i) => {
+          if (stopped) {
+            return `<tr class="skip"><td class="num">${i + 1}</td><td><code>${r.cand.id}</code></td><td colspan="3" class="miss">not reached &mdash; the pair was already complete</td></tr>`;
+          }
+          running += r.totalMs;
+          const fresh = r.found.filter((f) => !pooled.has(f.text));
+          fresh.forEach((f) => pooled.add(f.text));
+          stopped = pooled.size >= MAX_CODES;
+          return `<tr>
+            <td class="num">${i + 1}</td>
+            <td><code>${r.cand.id}</code></td>
+            <td>${fresh.length ? `<b>+${fresh.map((f) => f.text.slice(0, 16)).join(", ")}</b>` : '<span class="miss">nothing</span>'}</td>
+            <td class="num">${pooled.size}/${MAX_CODES}</td>
+            <td class="num">${running.toFixed(0)} ms${stopped ? " &nbsp;← stops here" : ""}</td>
+          </tr>`;
+        });
+
+        const winners = rows.filter((r) => r.found.length);
+        const relock = winners.reduce((a, r) => a + r.totalMs, 0);
+
+        document.getElementById("loop").innerHTML = `
+          <table>
+            <tr><th>#</th><th>correction</th><th>found</th><th>pooled</th><th>elapsed</th></tr>
+            ${lines.join("")}
+          </table>
+          <p class="env">On the <em>next</em> frame the two winners are tried first, because a
+          correction that worked is remembered and promoted. Re-reading the same bottle then costs
+          about ${relock.toFixed(0)} ms instead of ${running.toFixed(0)} ms &mdash; which is why the
+          scanner feels instant once it has locked on, and slowest on the first frame or after you
+          move to a different bottle.</p>`;
       }
 
       function renderPerf(rows, count) {
